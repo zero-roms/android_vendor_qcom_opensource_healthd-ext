@@ -5,6 +5,8 @@
 
 #define LOG_TAG "android.hardware.health-service.qti"
 
+#include <algorithm>
+
 #include <android-base/logging.h>
 #include <android/binder_interface_utils.h>
 #include <cutils/klog.h>
@@ -45,6 +47,44 @@ class ChargerCallbackImpl : public ChargerCallback {
 };
 } //namespace aidl::android::hardware::health
 #endif
+
+namespace aidl::android::hardware::health {
+// Kernels without a state_of_health power_supply file (such as 4.14 on sm6125)
+// leave the battery's state of health at 0 although full charge and design
+// capacity are known. Derive it from those two in that case.
+class HealthImpl : public Health {
+  public:
+    using Health::Health;
+
+    ndk::ScopedAStatus getBatteryHealthData(BatteryHealthData* out) override {
+        auto status = Health::getBatteryHealthData(out);
+        if (status.isOk() && out->batteryStateOfHealth <= 0) {
+            out->batteryStateOfHealth = DerivedStateOfHealth();
+        }
+        return status;
+    }
+
+  protected:
+    void UpdateHealthInfo(HealthInfo* health_info) override {
+        if (health_info->batteryHealthData.has_value() &&
+            health_info->batteryHealthData->batteryStateOfHealth <= 0) {
+            health_info->batteryHealthData->batteryStateOfHealth = DerivedStateOfHealth();
+        }
+    }
+
+  private:
+    int64_t DerivedStateOfHealth() const {
+        int64_t full = getFullChargeUah();
+        int64_t design = getFullChargeDesignCapacityUah();
+        if (full <= 0 || design <= 0) {
+            return 0;
+        }
+        return std::min<int64_t>(100, (full * 100 + design / 2) / design);
+    }
+};
+} //namespace aidl::android::hardware::health
+
+using aidl::android::hardware::health::HealthImpl;
 
 static constexpr const char* gInstanceName = "default";
 static constexpr std::string_view gChargerArg{"--charger"};
@@ -131,7 +171,7 @@ int main(int argc, char** argv) {
     auto config = std::make_unique<healthd_config>();
     ::android::hardware::health::InitHealthdConfig(config.get());
     qti_healthd_board_init(config.get());
-    auto binder = ndk::SharedRefBase::make<Health>(gInstanceName, std::move(config));
+    auto binder = ndk::SharedRefBase::make<HealthImpl>(gInstanceName, std::move(config));
 
     if (argc >= 2 && argv[1] == gChargerArg) {
 #if !CHARGER_FORCE_NO_UI
